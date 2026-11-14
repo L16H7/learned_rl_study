@@ -12,12 +12,10 @@ environments, one update per iteration); with 16 environments that is 8 updates 
   uv run python train_disco.py --out runs/disco_lr1e-3_s0 --lr 1e-3 --seed 0
 """
 import argparse
-import collections
 
 import dm_env
 import jax
 import numpy as np
-import rlax
 from dm_env import specs
 
 import common
@@ -51,6 +49,38 @@ class BatchedEnv(base.Environment):
         obs, rewards, dones = self.vec.step(actions)
         step_type = np.where(dones, dm_env.StepType.LAST, dm_env.StepType.MID).astype(np.int32)
         return None, types.EnvironmentTimestep(observation=obs, step_type=step_type, reward=rewards)
+
+
+class ReplayBuffer:
+    """The most recent `capacity` trajectories. Every array has time on axis 0 and the trajectory on
+    axis 1, like a rollout."""
+
+    def __init__(self, capacity: int):
+        self.capacity, self.size, self.next, self.data = capacity, 0, 0, None
+
+    def __len__(self):
+        return self.size
+
+    def add(self, rollout):
+        """Store the trajectories of a rollout (arrays of shape [time, num_envs, ...]), replacing the oldest."""
+        if self.data is None:
+            self.data = jax.tree.map(lambda x: np.zeros((x.shape[0], self.capacity, *x.shape[2:]), x.dtype), rollout)
+        n = jax.tree.leaves(rollout)[0].shape[1]
+        where = (self.next + np.arange(n)) % self.capacity
+
+        def store(data, x):
+            data[:, where] = x
+
+        jax.tree.map(store, self.data, rollout)
+        self.next = (self.next + n) % self.capacity
+        self.size = min(self.size + n, self.capacity)
+
+    def sample(self, rng: np.random.Generator, batch_size: int):
+        """`batch_size` stored trajectories, drawn uniformly with replacement."""
+        age_rank = rng.integers(self.size, size=batch_size)  # 0 is the oldest stored trajectory
+        oldest = self.next if self.size == self.capacity else 0
+        where = (oldest + age_rank) % self.capacity
+        return jax.tree.map(lambda data: data[:, where], self.data)
 
 
 def make_agent(rule: str, lr: float, env, torso=(512, 512), model_size: int = 128):
@@ -109,7 +139,7 @@ def main():
     learner_state = agent.initial_learner_state(key)
     actor_state = agent.initial_actor_state(key)
     _, ts = env.reset()
-    buffer = collections.deque(maxlen=args.buffer)
+    buffer = ReplayBuffer(args.buffer)
     np_rng = np.random.default_rng(args.seed + 17)
 
     updates = 0
@@ -121,13 +151,12 @@ def main():
             _, ts = env.step(None, actor_timestep.actions)
             timesteps.append(actor_timestep)
         rollout = jax.device_get(types.ActorRollout.from_timestep(utils.tree_stack(timesteps, axis=0)))
-        buffer.extend(rlax.tree_split_leaves(rollout, axis=1))  # one trajectory per environment
+        buffer.add(rollout)  # one trajectory per environment
 
         for _ in range(updates_per_rollout if len(buffer) >= args.batch_size else 0):
-            idx = np_rng.integers(len(buffer), size=args.batch_size)
-            batch = utils.tree_stack([buffer[i] for i in idx], axis=1)
             key, k = jax.random.split(key)
-            learner_state, _, _ = learner_step(k, batch, learner_state, actor_state, rule_params, False)
+            learner_state, _, _ = learner_step(k, buffer.sample(np_rng, args.batch_size), learner_state, actor_state,
+                                               rule_params, False)
             updates += 1
         log(env.vec.total_steps, updates, env.vec.finished, learner_state.params)
     log(env.vec.total_steps, updates, env.vec.finished, learner_state.params, final=True)

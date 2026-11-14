@@ -14,7 +14,12 @@ dependencies = [
     "matplotlib",
     "pillow",
     "minatar>=1.0.15",
+    "gymnax>=0.0.9",
 ]
+
+[project.optional-dependencies]
+# JAX with NVIDIA GPU support, Linux only: uv sync --extra cuda
+cuda = ["jax[cuda12]==0.6.2; sys_platform == 'linux'"]
 
 [tool.uv]
 package = false
